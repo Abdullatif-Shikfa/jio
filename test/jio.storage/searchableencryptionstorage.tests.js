@@ -6,36 +6,181 @@
   "use strict";
 
   var spec, use_fake_server = true;
-  if (typeof davstorage_spec === 'object') {
-    use_fake_server = false;
-    spec = dav_storage.createDescription(
-      davstorage_spec.url,
-      davstorage_spec.auth_type,
-      davstorage_spec.realm,
-      davstorage_spec.username,
-      davstorage_spec.password
-    );
-  } else {
-    spec = {//dav_storage.createDescription(
-      //"http://localhost",
-      //"none"
-    "type":"searchableencryptionhandler",  
-    "password":"coincoin",
-    "keywords":["1","2","3"],
-    "sub_storage": {"type":"searchableencryptionconnector","password":"coincoin", "url":"http://localhost"}    
-    };
+  spec = {
+    "url": "http://fakeserver",
+    "type": "searchableencryption",  
+    "password": "coincoin",
+  };
+
+  jIO.util.ajax = (function () {
+    // TEST SERVER
+    var baseURLRe = /^http:\/\/fakeserver(\/[^\/]+)?(\/[^\/]+)?$/;
+
+    var dataBase = {};
+
+  function bigModulo(arr, mod) {
+    var tmp, i, result = 0, base = 1;
+    for (i = 0; i < arr.length; i += 1) {
+        result = result + ((sjcl.bitArray.bitSlice(arr, i * 32, (i * 32) + 16)[0]) % mod) * base;
+        base = (base * Math.pow(2, 16)) % mod;
+        result = result + ((sjcl.bitArray.bitSlice(arr, (i * 32) + 16, (i + 1) * 32)[0]) % mod) * base;
+        base = (base * Math.pow(2, 16)) % mod;
+    }
+    result = result % mod; 
+    return result;
   }
 
-  module("Dav Storage");
+    function test(id, encryptedQuery) {
+      var j, result = true;
+      for (j = 0; j < encryptedQuery.length; j += 1) {
+        result = result && (dataBase[id].encryptedIndex[bigModulo(
+          sjcl.hash.sha256.hash(encryptedQuery[j] + id),
+          dataBase[id].encryptedIndex.length
+        )] === 1);
+      }
+      return result;
+    }
 
-  function success(promise) {
-    return new RSVP.Promise(function (resolve, reject, notify) {
-      /*jslint unparam: true*/
-      promise.then(resolve, resolve, notify);
-    }, function () {
-      promise.cancel();
-    });
-  }
+    function onPut(id, data) {
+      dataBase[id] = dataBase[id] || {};
+      dataBase[id].metadata = data.metadata;
+      dataBase[id].encryptedIndex = data.encryptedIndex;
+    }
+
+    //Caution: this method can throw an error if the document id does not
+    //already exist
+    //The attachment ID must not be metadata or encryptedIndex !
+    function onPutAttachment(id, idAttachment, data) {
+      dataBase[id][idAttachment] = data;
+    }
+
+    function onGet(id) {
+      return dataBase[id].metadata;
+    }
+
+    function onGetAttachement(id, idAttachment) {
+      return dataBase[id][idAttachment];
+    }
+
+    function onRemove(id) {
+      delete dataBase[id];
+    }
+
+    function onRemoveAttachment(id, idAttachment) {
+      delete dataBase[id][idAttachment];
+    }
+
+    function onAllDocs(encryptedQuery) {
+      /*jslint forin: true */
+      var id, result = [];
+      for (id in dataBase) {
+        if (test(id, encryptedQuery)) {
+          result.push(dataBase[id].metadata);
+        }
+      }
+      return result;
+    }
+    function FakeEvent(target) {
+      this.target = target;
+    }
+
+    function ServerAjax(param) {
+      return new RSVP.Promise(function (resolve, reject) {
+        // param.type || "GET"
+        // param.url
+        // param.dataType (ignored)
+        // param.headers (ignored)
+        // param.beforeSend (ignored)
+        // param.data
+        var re_result = baseURLRe.exec(param.url), xhr = {};
+        if (!re_result) {
+          xhr.status = 1; // wrong url
+          xhr.statusText = "Unknown";
+          return reject(new FakeEvent(xhr));
+        }
+        if (re_result[1]) {
+          re_result[1] = re_result[1].slice(1);
+        }
+        if (re_result[2]) {
+          re_result[2] = re_result[2].slice(1);
+        }
+        xhr.status = 404;
+        xhr.statusText = "Not Found";
+        if (!param.type || param.type === "GET") {
+          try {
+            if (re_result[2]) {
+              // jio.getAttachment
+              xhr.response = new Blob([
+                onGetAttachment(re_result[1], re_result[2])
+              ]);
+            } else {
+              // jio.get
+              xhr.response = onGet(re_result[1]);
+              xhr.responseText = xhr.response;
+            }
+          } catch (e) {
+            return reject(new FakeEvent(xhr));
+          }
+          xhr.status = 200;
+          xhr.statusText = "OK";
+          return resolve(new FakeEvent(xhr));
+        }
+        if (param.type === "DELETE") {
+          try {
+            if (re_result[2]) {
+              // jio.removeAttachment
+              onRemoveAttachment(re_result[1], re_result[2]);
+            } else {
+              // jio.remove
+              onRemove(re_result[1]);
+            }
+          } catch (e2) {
+            return reject(new FakeEvent(xhr));
+          }
+          xhr.status = 204;
+          xhr.statusText = "No Content";
+          return resolve(new FakeEvent(xhr));
+        }
+        xhr.status = 409;
+        xhr.statusText = "Conflict";
+        if (param.type === "POST") {
+          try {
+            if (re_result[1]) {
+              // jio.post
+            } else {
+              // jio.allDocs
+              xhr.response = onAllDocs(param.data.query);
+            }
+          } catch (e1) {
+            return reject(new FakeEvent(xhr));
+          }
+          xhr.status = 200;
+          xhr.statusText = "OK";
+          return resolve(new FakeEvent(xhr));
+        }
+        if (param.type === "PUT") {
+          try {
+            if (re_result[2]) {
+              // jio.putAttachment
+              onPutAttachment(re_result[1], re_result[2], param.data);
+            } else {
+              // jio.put
+              onPut(re_result[1], param.data);
+            }
+          } catch (e3) {
+            return reject(new FakeEvent(xhr));
+          }
+          xhr.status = 204;
+          xhr.statusText = "No Content";
+          return resolve(new FakeEvent(xhr));
+        }
+      });
+    }
+
+    return ServerAjax;
+  }());
+
+  module("Searchable Encryption Storage");
 
   /**
    * Tested with local webDav server
@@ -61,30 +206,7 @@
 
     stop();
 
-    if (use_fake_server) {
-      /*jslint regexp: true */
-      server = sinon.fakeServer.create();
-      server.autoRespond = true;
-      server.autoRespondAfter = 5;
-      server.respondWith(/.*/, function (xhr) {
-        var response = responses.shift();
-        if (response) {
-          return xhr.respond.apply(xhr, response);
-        }
-        ok(false, "No response associated to the latest request!");
-      });
-    } else {
-      responses.push = function () {
-        return;
-      };
-      server = {restore: function () {
-        return;
-      }};
-    }
-
-    function postNewDocument() {
-      responses.push([404, {}, '']); // GET
-      responses.push([201, {}, '']); // PUT
+/*     function postNewDocument() {
       return jio.post({"title": "Unique ID"});
     }
 
@@ -102,24 +224,19 @@
          "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx : " + uuid);
       shared.created_document_id = uuid;
     }
-
+ */
     function getCreatedDocument() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": shared.created_document_id,
-        "title": "Unique ID"
-      })]); // GET
-      return jio.get({"_id": shared.created_document_id});
+      return jio.get({"_id": "a"});
     }
 
     function getCreatedDocumentTest(answer) {
       deepEqual(answer, {
         "data": {
-          "_id": shared.created_document_id,
-          "title": "Unique ID"
+          "_id": "a",
+          "title": "Hey",
+          "keywords": ["1", "2", "3"]
         },
-        "id": shared.created_document_id,
+        "id": "a",
         "method": "get",
         "result": "success",
         "status": 200,
@@ -144,15 +261,10 @@
     }
 
     function listDocuments() {
-      responses.push([
-        207,
-        {"Content-Type": "text/xml"},
-        JSON.stringify([{"document":{"_id":shared.created_document_id}},{"document":{"_id":"b"}}])
-      ]); // PROPFIND
-      return jio.allDocs();
+      return jio.allDocs({"query": "1"});
     }
 
-    function list2DocumentsTest(answer) {
+    function listDocumentsTest(answer) {
       if (answer && answer.data && Array.isArray(answer.data.rows)) {
         answer.data.rows.sort(function (a) {
           return a.id === "b" ? 1 : 0;
@@ -162,7 +274,7 @@
         "data": {
           "total_rows": 2,
           "rows": [{
-            "id": shared.created_document_id,
+            "id": "a",
             "value": {}
           }, {
             "id": "b",
@@ -177,13 +289,6 @@
     }
 
     function removeCreatedDocument() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": shared.created_document_id,
-        "title": "Unique ID"
-      })]); // GET
-      responses.push([204, {}, '']); // DELETE
       return jio.remove({"_id": shared.created_document_id});
     }
 
@@ -198,13 +303,6 @@
     }
 
     function removeSpecificDocument() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "b",
-        "title": "Bee"
-      })]); // GET
-      responses.push([204, {}, '']); // DELETE
       return jio.remove({"_id": "b"});
     }
 
@@ -219,39 +317,6 @@
     }
 
     function listEmptyStorage() {
-      responses.push([
-        207,
-        {"Content-Type": "text/xml"},
-        '<?xml version="1.0" encoding="utf-8"?>' +
-          '<D:multistatus xmlns:D="DAV:">' +
-          '<D:response xmlns:lp2="http://apache.org/dav/props/" ' +
-          'xmlns:lp1="DAV:">' +
-          '<D:href>/uploads/</D:href>' +
-          '<D:propstat>' +
-          '<D:prop>' +
-          '<lp1:resourcetype><D:collection/></lp1:resourcetype>' +
-          '<lp1:creationdate>2013-09-19T11:54:43Z</lp1:creationdate>' +
-          '<lp1:getlastmodified>Thu, 19 Sep 2013 11:54:43 GMT' +
-          '</lp1:getlastmodified>' +
-          '<lp1:getetag>"240be-1000-4e6bb3840a9ac"</lp1:getetag>' +
-          '<D:supportedlock>' +
-          '<D:lockentry>' +
-          '<D:lockscope><D:exclusive/></D:lockscope>' +
-          '<D:locktype><D:write/></D:locktype>' +
-          '</D:lockentry>' +
-          '<D:lockentry>' +
-          '<D:lockscope><D:shared/></D:lockscope>' +
-          '<D:locktype><D:write/></D:locktype>' +
-          '</D:lockentry>' +
-          '</D:supportedlock>' +
-          '<D:lockdiscovery/>' +
-          '<D:getcontenttype>httpd/unix-directory</D:getcontenttype>' +
-          '</D:prop>' +
-          '<D:status>HTTP/1.1 200 OK</D:status>' +
-          '</D:propstat>' +
-          '</D:response>' +
-          '</D:multistatus>'
-      ]); // PROPFIND
       return jio.allDocs();
     }
 
@@ -269,9 +334,11 @@
     }
 
     function putNewDocument() {
-      responses.push([404, {}, '']); // GET
-      responses.push([201, {}, '']); // PUT
-      return jio.put({"_id": "a", "title": "Hey"});
+      return jio.put({
+        "_id": "a",
+        "title": "Hey",
+        "keywords": ["1", "2", "3"]
+      });
     }
 
     function putNewDocumentTest(answer) {
@@ -279,18 +346,30 @@
         "id": "a",
         "method": "put",
         "result": "success",
-        "status": 201,
-        "statusText": "Created"
+        "status": 204,
+        "statusText": "No Content"
       }, "Put new document");
     }
 
+    function putNewDocument2() {
+      return jio.put({
+        "_id": "b",
+        "title": "Hello",
+        "keywords": ["1", "4", "5"]
+      });
+    }
+
+    function putNewDocument2Test(answer) {
+      deepEqual(answer, {
+        "id": "b",
+        "method": "put",
+        "result": "success",
+        "status": 204,
+        "statusText": "No Content"
+      }, "Put new document");
+    }
+    
     function getCreatedDocument2() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hey"
-      })]); // GET
       return jio.get({"_id": "a"});
     }
 
@@ -309,12 +388,6 @@
     }
 
     function postSameDocument() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hey"
-      })]); // GET
       return success(jio.post({"_id": "a", "title": "Hoo"}));
     }
 
@@ -332,14 +405,6 @@
     }
 
     function createAttachment() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hey"
-      })]); // GET
-      responses.push([201, {}, '']); // PUT (attachment)
-      responses.push([204, {}, '']); // PUT (metadata)
       return jio.putAttachment({
         "_id": "a",
         "_attachment": "aa",
@@ -362,22 +427,6 @@
     }
 
     function updateAttachment() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hey",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-9834876dcfb05cb167a5c24953eba58c4" +
-              "ac89b1adf57f28f2f9d09af107ee8f0",
-            "length": 3
-          }
-        }
-      })]); // GET
-      responses.push([204, {}, '']); // PUT (attachment)
-      responses.push([204, {}, '']); // PUT (metadata)
       return jio.putAttachment({
         "_id": "a",
         "_attachment": "aa",
@@ -400,22 +449,6 @@
     }
 
     function createAnotherAttachment() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hey",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          }
-        }
-      })]); // GET
-      responses.push([201, {}, '']); // PUT (attachment)
-      responses.push([204, {}, '']); // PUT (metadata)
       return jio.putAttachment({
         "_id": "a",
         "_attachment": "ab",
@@ -438,27 +471,6 @@
     }
 
     function updateLastDocument() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hey",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          },
-          "ab": {
-            "content_type": "text/plain",
-            "digest": "sha256-e124adcce1fb2f88e1ea799c3d0820845" +
-              "ed343e6c739e54131fcb3a56e4bc1bd",
-            "length": 3
-          }
-        }
-      })]); // GET
-      responses.push([204, {}, '']); // PUT
       return jio.put({"_id": "a", "title": "Hoo"});
     }
 
@@ -473,29 +485,6 @@
     }
 
     function getFirstAttachment() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hoo",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          },
-          "ab": {
-            "content_type": "text/plain",
-            "digest": "sha256-e124adcce1fb2f88e1ea799c3d0820845" +
-              "ed343e6c739e54131fcb3a56e4bc1bd",
-            "length": 3
-          }
-        }
-      })]); // GET
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, "aab"]); // GET
       return jio.getAttachment({"_id": "a", "_attachment": "aa"});
     }
 
@@ -522,29 +511,6 @@
     }
 
     function getSecondAttachment() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hoo",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          },
-          "ab": {
-            "content_type": "text/plain",
-            "digest": "sha256-e124adcce1fb2f88e1ea799c3d0820845" +
-              "ed343e6c739e54131fcb3a56e4bc1bd",
-            "length": 3
-          }
-        }
-      })]); // GET
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, "aba"]); // GET
       return jio.getAttachment({"_id": "a", "_attachment": "ab"});
     }
 
@@ -571,26 +537,6 @@
     }
 
     function getLastDocument() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hoo",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          },
-          "ab": {
-            "content_type": "text/plain",
-            "digest": "sha256-e124adcce1fb2f88e1ea799c3d0820845" +
-              "ed343e6c739e54131fcb3a56e4bc1bd",
-            "length": 3
-          }
-        }
-      })]); // GET
       return jio.get({"_id": "a"});
     }
 
@@ -623,28 +569,6 @@
     }
 
     function removeSecondAttachment() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hoo",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          },
-          "ab": {
-            "content_type": "text/plain",
-            "digest": "sha256-e124adcce1fb2f88e1ea799c3d0820845" +
-              "ed343e6c739e54131fcb3a56e4bc1bd",
-            "length": 3
-          }
-        }
-      })]); // GET
-      responses.push([204, {}, '']); // PUT
-      responses.push([204, {}, '']); // DELETE
       return jio.removeAttachment({"_id": "a", "_attachment": "ab"});
     }
 
@@ -660,20 +584,6 @@
     }
 
     function getInexistentSecondAttachment() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hoo",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          }
-        }
-      })]); // GET
       return success(jio.getAttachment({"_id": "a", "_attachment": "ab"}));
     }
 
@@ -692,20 +602,6 @@
     }
 
     function getOneAttachmentDocument() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hoo",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          }
-        }
-      })]); // GET
       return jio.get({"_id": "a"});
     }
 
@@ -732,20 +628,6 @@
     }
 
     function removeSecondAttachmentAgain() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hoo",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          }
-        }
-      })]); // GET
       return success(jio.removeAttachment({"_id": "a", "_attachment": "ab"}));
     }
 
@@ -764,22 +646,6 @@
     }
 
     function removeDocument() {
-      responses.push([200, {
-        "Content-Type": "application/octet-stream"
-      }, JSON.stringify({
-        "_id": "a",
-        "title": "Hoo",
-        "_attachments": {
-          "aa": {
-            "content_type": "text/plain",
-            "digest": "sha256-38760eabb666e8e61ee628a17c4090cc5" +
-              "0728e095ff24218119d51bd22475363",
-            "length": 3
-          }
-        }
-      })]); // GET
-      responses.push([204, {}, '']); // DELETE (metadata)
-      responses.push([204, {}, '']); // DELETE (attachment aa)
       return jio.remove({"_id": "a"});
     }
 
@@ -794,7 +660,6 @@
     }
 
     function getInexistentFirstAttachment() {
-      responses.push([404, {}, '']); // GET
       return success(jio.getAttachment({"_id": "a", "_attachment": "aa"}));
     }
 
@@ -813,7 +678,6 @@
     }
 
     function getInexistentDocument() {
-      responses.push([404, {}, '']); // GET
       return success(jio.get({"_id": "a"}));
     }
 
@@ -831,7 +695,6 @@
     }
 
     function removeInexistentDocument() {
-      responses.push([404, {}, '']); // GET
       return success(jio.remove({"_id": "a"}));
     }
 
@@ -860,11 +723,15 @@
     }
 
     // # Post new documents, list them and remove them
-    // post a 201
-    postNewDocument().then(postNewDocumentTest).
+    // put a 204
+    putNewDocument().then(putNewDocumentTest).
       // get 200
       then(getCreatedDocument).then(getCreatedDocumentTest).
-      // post b 201
+      // put b 204
+      then(putNewDocument2).then(putNewDocument2Test).
+      // allD 200 2 documents
+      then(listDocuments).then(listDocumentsTest).
+      /*      // post b 201
       then(postSpecificDocument).then(postSpecificDocumentTest).
       // allD 200 2 documents
       then(listDocuments).then(list2DocumentsTest).
@@ -914,11 +781,10 @@
 //      then(removeInexistentDocument).then(removeInexistentDocumentTest).
       // check 204
       //then(checkDocument).done(checkDocumentTest).
-      //then(checkStorage).done(checkStorageTest).
+      //then(checkStorage).done(checkStorageTest).*/
       fail(unexpectedError).
-      always(start).
-      always(server.restore.bind(server));
-
+      always(start);
+//      always(server.restore.bind(server));
   });
 
 }());
