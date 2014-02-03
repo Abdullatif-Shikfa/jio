@@ -1,3 +1,9 @@
+/***********************************************************************
+**   Written by Abdullatif Shikfa, Alcatel Lucent Bell-Labs France    **
+**      With the invaluable help of Tristan Cavelier, Nexedi          **
+**                        31/01/2014                                  **
+***********************************************************************/
+
 /*jslint indent:2,maxlen:80,nomen:true*/
 /*global  jIO, define, exports, require, sjcl*/
 
@@ -80,19 +86,19 @@
   * regular integers (of 32 bits) in big endian in an array.
   * The function leverages the modulo operation on integers implemented in 
   * javascript to perform the modulo on the large integer : it computes the
-  * modulo of each integer of the array multiplied by the modulo of the base
-  * (2 to the power 32) to the power of the position in the array.
+  * modulo of each integer of the array multiplied by the modulo of the
+  * base (2 to the power 32) to the power of the position in the array.
+  * However, since javascript encodes integers on 32 bits we have to add another
+  * trick: we do the computations on half words and we use the function
+  * sjcl.bitArray.bitSlice which extracts some bits out of a bit array, and we
+  * and we thus mutliply by half of the base.
   */
 
   function bigModulo(arr, mod) {
-    var i, result = 0, base = 1;
-    for (i = 0; i < arr.length; i += 1) {
+    var i, result = 0, base = 1, maxIter = (2 * arr.length);
+    for (i = 0; i < maxIter; i += 1) {
       result = result + (
-        (sjcl.bitArray.bitSlice(arr, i * 32, (i * 32) + 16)[0]) % mod
-      ) * base;
-      base = (base * Math.pow(2, 16)) % mod;
-      result = result + (
-        (sjcl.bitArray.bitSlice(arr, (i * 32) + 16, (i + 1) * 32)[0]) % mod
+        (sjcl.bitArray.bitSlice(arr, i * 16, (i + 1) * 16)[0]) % mod
       ) * base;
       base = (base * Math.pow(2, 16)) % mod;
     }
@@ -118,7 +124,7 @@
   *   For each keyword in the array keywords compute errorRate hashes:
   *       Each hash is the SHA256 function applied to the keyword concatenated
   *       with the password and the iterator of the hash function (j). The
-  *       resulting digest is an array that is converted to a string and
+  *       resulting digest is an array that is converted to a base64 string and
   *       concatenated with the id of the documents (to obtain different results
   *       if a given keyword is found in several documents). The result is then
   *       taken modulo the length of the Bloom Filter and indicates a position
@@ -126,6 +132,8 @@
   * In the end there are at most bFLength * errorRate 1s in the array (and in
   * fact less because several keywords can lead to the same position for
   * different hash functions).
+  * This function can only be executed at client side as it requires the
+  * password for searchable encryption to be executed.
   */
 
   function constructBloomFilter(
@@ -149,6 +157,20 @@
     return result;
   }
 
+  /**
+  * constructEncryptedQuery is a function that constructs an encrypted query
+  * from a keyword and a password. It basically performs the first step of
+  * adding a word to a Bloom Filter.
+  * It hashes the keyword errorRate times using different hash functions.
+  * Each hash is the SHA256 function applied to the keyword concatenated
+  * with the password and the iterator of the hash function (j). The
+  * resulting digest is an array that is converted to a base64 string using the 
+  * sjcl.codec.base64.fromBits function.
+  * In the end, the encrypted query corresponding to a keyword is an array of 
+  * errorRates base64 strings. Note that the query can only be computed by the
+  * client as it requires knowledge of the secret key.
+  */
+
   function constructEncryptedQuery(
     password,
     errorRate,
@@ -165,7 +187,7 @@
   }
 
 
-  /* Encrypt a message */
+/*  // Encrypt a message
   function encrypt(plaintext, password) {
     var rp = {}, ct, p;
 
@@ -183,7 +205,7 @@
     return JSON.parse(ct).ct;
   }
 
-  /* Decrypt a message */
+  // Decrypt a message 
   function decrypt(ciphertext, password) {
     var p, plaintext, rp = {};
     p = {
@@ -199,31 +221,8 @@
     };
     plaintext = sjcl.decrypt(password, JSON.stringify(p), {}, rp);
     return plaintext;
-  }
-  //Copied from the davstorage connector
-  /**
-   * Creates a new document if not already exists
-   *
-   * @method post
-   * @param  {Object} command The JIO command
-   * @param  {Object} metadata The metadata to put
-   * @param  {Object} options The command options
-   */
-/*   SearchableEncryptionStorageConnector.prototype.post = function (
-    command,
-    metadata
-  ) {
- //   this.postOrPut('post', command, metadata);
-    metadata.encryptedIndex = constructBloomFilter(
-      this._password,
-      this._errorRate,
-      this._nbMaxKeywords,
-      this._keywords,
-      metadata._id
-    );
-  }; */
+  }*/
 
-//Copied from the davstorage connector
   /**
    * Creates or updates a document
    *
@@ -236,15 +235,22 @@
     command,
     metadata
   ) {
- //   this.postOrPut('put', command, metadata);
+// First create the associated encryptedIndex to allow encrypted queries at a 
+// later stage
+// Then we encrypt the data using sjcl library. This step is independant of 
+// the searchable encryption features, however it is also related to
+// confidentiality hence we added it here as an example of how to use the sjcl
+// library. Note that for the sake of simplicity we used the same password for
+// encryption and searchable encryption functions but in fact it could be two
+// different keys.
     var encryptedIndex = constructBloomFilter(
       this._password,
       this._errorRate,
       this._nbMaxKeywords,
       metadata.keywords,
       metadata._id
-    ), data = JSON.stringify(metadata);
-    //encrypt(JSON.stringify(metadata), this._password);
+    ), data = sjcl.encrypt(this._password, JSON.stringify(metadata));
+// The remainder is a classical put using the ajax method
     jIO.util.ajax({
       "type": "PUT",
       "url": this._url + "/" + metadata._id,
@@ -263,6 +269,52 @@
   };
 
   /**
+   * Creates a document if it does not already exist.
+   *
+   * @method post
+   * @param  {Object} command The JIO command
+   * @param  {Object} metadata The metadata to post
+   * @param  {Object} options The command options
+   */
+  SearchableEncryptionStorageConnector.prototype.post = function (
+    command,
+    metadata
+  ) {
+// First create the associated encryptedIndex to allow encrypted queries at a 
+// later stage
+// Then we encrypt the data using sjcl library. This step is independant of 
+// the searchable encryption features, however it is also related to
+// confidentiality hence we added it here as an example of how to use the sjcl
+// library. Note that for the sake of simplicity we used the same password for
+// encryption and searchable encryption functions but in fact it could be two
+// different keys.
+    var encryptedIndex = constructBloomFilter(
+      this._password,
+      this._errorRate,
+      this._nbMaxKeywords,
+      metadata.keywords,
+      metadata._id
+    ), data = sjcl.encrypt(this._password, JSON.stringify(metadata));
+// The remainder is a classical put using the ajax method
+    jIO.util.ajax({
+      "type": "POST",
+      "url": this._url + "/" + metadata._id,
+      "dataType": "json",
+      "data": {"metadata": data, "encryptedIndex": encryptedIndex}
+    }).then(function (e) {
+      command.success(e.target.status);
+    }, function (e) {
+      var xhr = e.target;
+      command.reject(
+        xhr.status,
+        xhr.statusText,
+        "Document update from server failed"
+      );
+    });
+  };
+
+
+  /**
    * Adds attachments to a document
    *
    * @method putAttachment
@@ -274,6 +326,9 @@
     command,
     param
   ) {
+// This function adds an attachment to a document, it has nothing specific to
+// searchable encryption. Optionally the attachment could be encrypted as well
+// using the same primitive shown in previous methods.
     jIO.util.ajax({
       "type": "PUT",
       "url": this._url + "/" + param._id + "/" + param._attachment,
@@ -291,7 +346,6 @@
     });
   };
 
-  //Copied from the davstorage connector
   /**
   * Retrieve metadata
   *
@@ -304,13 +358,18 @@
     command,
     param
   ) {
-
+// This function retrieves a document given its ID. It is not specific to
+// searchable encryption. Here we also have to decrypt the metadata as we
+// encrypted them in the put or post methods.
+    var that = this;
     jIO.util.ajax({
       "type": "GET",
       "url": this._url + "/" + param._id
     }).then(function (e) {
-      var data = JSON.parse(e.target.responseText);
-      //JSON.parse(decrypt(e.target.responseText, this._password));
+      var data = JSON.parse(sjcl.decrypt(
+        that._password,
+        e.target.responseText
+      ));
       command.success(e.target.status, {"data": data});
     }, function (e) {
       var xhr = e.target;
@@ -326,6 +385,8 @@
     command,
     param
   ) {
+// This function retrieves an attachment of a document. Nothing specific to 
+// searchable encryption either.
     jIO.util.ajax({
       "type": "GET",
       "url": this._url + "/" + param._id + "/" + param._attachment
@@ -345,6 +406,8 @@
     command,
     param
   ) {
+// This function removes a document. Nothing specific to 
+// searchable encryption either.    
     jIO.util.ajax({
       "type": "DELETE",
       "url": this._url + "/" + param._id
@@ -364,6 +427,8 @@
     command,
     param
   ) {
+// This function removes an attachment of a document. Nothing specific to 
+// searchable encryption either.
     jIO.util.ajax({
       "type": "DELETE",
       "url": this._url + "/" + param._id + "/" + param._attachment
@@ -379,11 +444,24 @@
     });
   };
 
-/*
-AllDocs sends to the server the encrypted query.
-This is a dictionary with the key "query" and the associated value is an
-array of strings computed by constructEncryptedQuery.
-*/
+/** 
+ * AllDocs deals with encrypted queries. This is a core function of the
+ * searchable encryption connector.
+ * In this version, AllDOcs enables to retrieve all documents containing a
+ * keyword. However the server should not learn the keyword, and it should not
+ * learn anything with respect to the documents either if they are encrypted.
+ * The trick here is that the function encrypts the query (composed of a single
+ * keyword) by performing the first steps of the construction of the Bloom
+ * Filters: it hashes the keyword concatenated with the password and an 
+ * iterator (which takes values between 0 and errorRate) and thus obtains an 
+ * array of errorRate rows, each row is converted to a base64 string.
+ * Using this encrypted query the servers tests all documents it has stored with
+ * their respective encrypted indexes, and it returns the list of documents
+ * that match the query (without understanding the query though!). AllDocs
+ * simply has to decrypt all documents at this stage (since we encrypted them in
+ * the put and post steps): the user gets the documents he searched for with a 
+ * high level of confidentiality against the server.
+ */
   SearchableEncryptionStorageConnector.prototype.allDocs = function (
     command,
     param,
@@ -391,9 +469,7 @@ array of strings computed by constructEncryptedQuery.
   ) {
 
     /*jslint unparam: true */
-    var query;
-//      complex_queries.QueryFactory.create(options.query || "").
-    //  exec(document_list, options);
+    var query, that = this;
     query = constructEncryptedQuery(
       this._password,
       this._errorRate,
@@ -408,8 +484,7 @@ array of strings computed by constructEncryptedQuery.
     }).then(function (e) {
       var document_list = e.target.response;
       document_list = document_list.map(function (param) {
-//        param = JSON.parse(decrypt(param, this._password));
-        param = JSON.parse(param);
+        param = JSON.parse(sjcl.decrypt(that._password, param));
         var row = {
           "id": param._id,
           "value": {}
@@ -436,4 +511,4 @@ array of strings computed by constructEncryptedQuery.
   jIO.addStorage("searchableencryption", SearchableEncryptionStorageConnector);
 }));
 
-// il faut encore définir: post, check and repair
+// Methods remaining to be defined: only check and repair
